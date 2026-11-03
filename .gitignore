@@ -1,0 +1,44 @@
+# Build output
+/bin/
+/dist/
+/cache
+/cache.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries, coverage, and profiles
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+*.prof
+
+# Go workspace files (local development only)
+go.work
+go.work.sum
+
+# Local environment files
+.env
+.env.local
+
+# Runtime artifacts
+*.log
+*.pid
+/data/
+/tmp/
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

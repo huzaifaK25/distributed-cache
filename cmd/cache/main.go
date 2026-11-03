@@ -13,6 +13,9 @@ import (
 	"distributed-cache/internal/server"
 )
 
+// TODO: make func main strictly typedmeaning initialize forst with var and type, then assign values.
+// TODO: add comments for each portion in main() for what it does. For example, explain what the flags are for, what the cache is for, and what the server is for.
+
 func main() {
 	config := server.DefaultConfig()
 	var (

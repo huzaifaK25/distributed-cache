@@ -38,8 +38,9 @@ problems.
 
 ## Project Status
 
-Phases 1 through 3 are complete: a TCP-accessible, single-node in-memory cache
-with TTL expiration, LRU eviction, bounded concurrency, and graceful shutdown.
+Phases 1 through 4 are complete: a TCP-accessible in-memory cache with TTL
+expiration, LRU eviction, bounded concurrency, and a cluster membership layer
+with gossip and health detection.
 
 Completed features:
 
@@ -53,6 +54,9 @@ Completed features:
 - ✅ Bounded worker pool
 - ✅ Connection limits and idle timeouts
 - ✅ Graceful shutdown
+- ✅ Cluster membership and discovery
+- ✅ Heartbeats and health tracking
+- ✅ Gossip convergence
 
 Phase 2 additions:
 
@@ -71,6 +75,15 @@ Phase 3 additions:
 - Graceful shutdown that finishes in-flight requests
 - Protocol, worker-pool, multi-client, and 1000-connection tests
 - Server throughput and connection benchmarks
+
+Phase 4 additions:
+
+- Node model, thread-safe registry, and cluster metadata
+- TCP join, leave, heartbeat, and gossip messages
+- `ONLINE`, `DEGRADED`, and `OFFLINE` health states
+- Versioned membership updates and leave tombstones
+- Push-pull anti-entropy gossip with join/leave convergence tests
+- Simulated network delay and packet-loss tests
 
 ## Requirements
 
@@ -96,6 +109,12 @@ distributed-cache/
 |   |-- protocol.go       # Command parser
 |   |-- handler.go        # Command-to-cache mapping
 |   `-- workerpool.go     # Fixed workers and bounded queue
+|-- internal/cluster/
+|   |-- node.go           # Node, NodeID, and health states
+|   |-- registry.go       # Thread-safe membership registry
+|   |-- membership.go     # Lifecycle, join, leave, and metadata
+|   |-- heartbeat.go      # I_AM_ALIVE loop and health updates
+|   `-- gossip.go         # Wire protocol, transport, and anti-entropy
 |-- tests/
 |   |-- cache_test.go     # Cache unit and concurrency tests
 |   |-- ttl_test.go       # TTL and cleanup tests
@@ -103,12 +122,14 @@ distributed-cache/
 |   |-- server_test.go    # Protocol and multi-client tests
 |   |-- server_connection_test.go # Limits, idle timeout, 1000 clients
 |   |-- server_shutdown_test.go   # Graceful shutdown tests
+|   |-- cluster_test.go   # Multi-node join, leave, health, convergence
 |   |-- benchmark_test.go # Cache benchmarks
 |   `-- server_benchmark_test.go  # Server benchmarks
 |-- docs/
 |   |-- phase-1-core-cache.md
 |   |-- phase-2-production-features.md
-|   `-- phase-3-network-server.md
+|   |-- phase-3-network-server.md
+|   `-- phase-4-cluster-management.md
 |-- go.mod
 `-- README.md
 ```
@@ -158,6 +179,47 @@ if err := s.Start(); err != nil {
 defer s.Stop()
 ```
 
+Cluster membership is a separate layer that will be wired into the cache server in
+later phases:
+
+```go
+a, err := cluster.New(cluster.Config{
+	ClusterID: "cache-prod",
+	NodeID:    "node-a",
+	Address:   "127.0.0.1:7001",
+})
+if err != nil {
+	log.Fatal(err)
+}
+if err := a.Start(); err != nil {
+	log.Fatal(err)
+}
+defer a.Stop()
+
+b, err := cluster.New(cluster.Config{
+	ClusterID: "cache-prod",
+	NodeID:    "node-b",
+	Address:   "127.0.0.1:7002",
+})
+if err != nil {
+	log.Fatal(err)
+}
+if err := b.Start(); err != nil {
+	log.Fatal(err)
+}
+defer b.Stop()
+
+if err := b.Join(a.Addr().String()); err != nil {
+	log.Fatal(err)
+}
+```
+
+`Join` accepts one or more seed addresses and succeeds when at least one seed is
+reachable. Membership snapshots propagate transitively through gossip, so later
+nodes can join any existing member. Use `Nodes`, `Node`, and `Metadata` to inspect
+the current view. `Leave` announces a graceful exit; `Stop` shuts down without
+announcing.
+
 Protocol summary:
 
 | Command | Response |
@@ -195,6 +257,21 @@ Server options (zero values use `server.DefaultConfig`):
 | `ShutdownTimeout` | `10s` | Bound graceful shutdown. |
 | `MaxRequestSize` | `64 KiB` | Maximum command-line bytes. |
 
+Cluster options (zero values use `cluster.DefaultConfig`):
+
+| Option | Default | Behavior |
+|---|---:|---|
+| `ClusterID` | required | Must match across members of one cluster. |
+| `NodeID` | required | Unique member identity for the cluster lifetime. |
+| `Address` | `127.0.0.1:0` | Cluster RPC listen address. |
+| `HeartbeatInterval` | `1s` | Liveness probe and health-evaluation interval. |
+| `GossipInterval` | `2s` | Membership anti-entropy interval. |
+| `DegradedAfter` | `3s` | Silence before a node becomes `DEGRADED`. |
+| `OfflineAfter` | `10s` | Silence before a node becomes `OFFLINE`; must exceed `DegradedAfter`. |
+| `RequestTimeout` | `2s` | Bound on one join, heartbeat, gossip, or leave RPC. |
+| `ShutdownTimeout` | `5s` | Bound on graceful cluster shutdown. |
+| `MaxMessageSize` | `1 MiB` | Maximum encoded cluster message size. |
+
 Behavior notes:
 
 - `Set` clears any previous TTL.
@@ -203,6 +280,9 @@ Behavior notes:
 - `StartCleanupWorker` and `StopCleanupWorker` are idempotent and support restart.
 - `Server.Stop` is idempotent and finishes in-flight requests.
 - A `Server` cannot be restarted after `Stop`.
+- `Cluster.Leave` removes the node from peers and records a tombstone; `Cluster.Stop` does not announce a leave.
+- Crashed nodes remain in the view as `OFFLINE`; `Leave` removes them from the view.
+- A `Cluster` cannot be restarted after `Stop`.
 
 ## Build and Run
 
@@ -260,13 +340,14 @@ results:
 - [Phase 1 - Core Cache Engine](docs/phase-1-core-cache.md)
 - [Phase 2 - Production Cache Features](docs/phase-2-production-features.md)
 - [Phase 3 - Network Server](docs/phase-3-network-server.md)
+- [Phase 4 - Cluster Management](docs/phase-4-cluster-management.md)
 
 ## Roadmap
 
 1. ✅ Core Cache Engine
 2. ✅ Production Cache Features (TTL, cleanup, LRU, limits)
 3. ✅ Networked Cache Server
-4. Multi-Node Cluster
+4. ✅ Cluster Membership (gossip, heartbeats, health)
 5. Replication
 6. Failover
 7. Consistent Hashing

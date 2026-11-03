@@ -1,5 +1,9 @@
 # Phase 1 - Core Cache Engine
 
+> Historical note: Phase 2 replaced the RWMutex with a plain Mutex because LRU
+> tracking makes every `Get` a mutation. It also added TTL, cleanup, and
+> eviction. See [Phase 2](phase-2-production-features.md) for the current design.
+
 ## Overview
 
 Phase 1 implements a standalone, thread-safe in-memory cache library. It is the

@@ -8,8 +8,16 @@ import (
 	"distributed-cache/internal/cache"
 )
 
+// newTestCache creates a cache and guarantees its cleanup worker is stopped.
+func newTestCache(t *testing.T, config cache.Config) *cache.InMemoryCache {
+	t.Helper()
+	c := cache.New(config)
+	t.Cleanup(c.StopCleanupWorker)
+	return c
+}
+
 func TestSetAndGet(t *testing.T) {
-	c := cache.New()
+	c := newTestCache(t, cache.Config{})
 
 	// Cover common value types plus nil, which must still report found=true.
 	tests := []struct {
@@ -54,7 +62,7 @@ func TestSetAndGet(t *testing.T) {
 }
 
 func TestMissingKey(t *testing.T) {
-	c := cache.New()
+	c := newTestCache(t, cache.Config{})
 
 	value, found := c.Get("does-not-exist")
 	if found {
@@ -70,7 +78,7 @@ func TestMissingKey(t *testing.T) {
 }
 
 func TestDelete(t *testing.T) {
-	c := cache.New()
+	c := newTestCache(t, cache.Config{})
 
 	if err := c.Set("key", "value"); err != nil {
 		t.Fatalf("Set() returned error: %v", err)
@@ -95,7 +103,7 @@ func TestDelete(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
-	c := cache.New()
+	c := newTestCache(t, cache.Config{})
 
 	if err := c.Set("a", 1); err != nil {
 		t.Fatalf("Set() returned error: %v", err)
@@ -127,7 +135,7 @@ func TestConcurrentWritersAndReaders(t *testing.T) {
 		readsPerReader  = 100
 	)
 
-	c := cache.New()
+	c := newTestCache(t, cache.Config{})
 	start := make(chan struct{}) // Releases all goroutines together to maximize contention.
 	var wg sync.WaitGroup
 

@@ -1,55 +1,58 @@
-// Command cache demonstrates the Phase 2 in-memory cache engine.
-// A later phase will turn this entry point into a network server.
+// Command cache runs the Phase 3 TCP cache server.
 package main
 
 import (
-	"fmt"
+	"flag"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"distributed-cache/internal/cache"
+	"distributed-cache/internal/server"
 )
 
 func main() {
-	// MaxItems enables LRU eviction; a positive CleanupInterval starts the
-	// background expiration worker.
+	config := server.DefaultConfig()
+	var (
+		maxItems        int
+		cleanupInterval time.Duration
+	)
+
+	flag.StringVar(&config.Address, "addr", config.Address, "TCP listen address")
+	flag.IntVar(&config.MaxConnections, "max-conns", config.MaxConnections, "maximum simultaneous clients")
+	flag.IntVar(&config.WorkerCount, "workers", config.WorkerCount, "request worker goroutines")
+	flag.IntVar(&config.QueueSize, "queue-size", config.QueueSize, "maximum queued requests")
+	flag.DurationVar(&config.IdleTimeout, "idle-timeout", config.IdleTimeout, "close idle client connections after this duration")
+	flag.DurationVar(&config.WriteTimeout, "write-timeout", config.WriteTimeout, "maximum time to write one response")
+	flag.DurationVar(&config.ShutdownTimeout, "shutdown-timeout", config.ShutdownTimeout, "maximum graceful shutdown wait")
+	flag.IntVar(&config.MaxRequestSize, "max-request-size", config.MaxRequestSize, "maximum command-line bytes")
+	flag.IntVar(&maxItems, "max-items", 0, "maximum cache entries (<=0 means unlimited)")
+	flag.DurationVar(&cleanupInterval, "cleanup-interval", 30*time.Second, "expired-key sweep interval (<=0 disables the worker)")
+	flag.Parse()
+
 	c := cache.New(cache.Config{
-		MaxItems:        2,
-		CleanupInterval: time.Minute,
+		MaxItems:        maxItems,
+		CleanupInterval: cleanupInterval,
 	})
 	defer c.StopCleanupWorker()
 
-	// A normal value without expiration.
-	if err := c.Set("language", "Go"); err != nil {
-		log.Fatalf("set: %v", err)
+	srv := server.New(c, config)
+	if err := srv.Start(); err != nil {
+		log.Fatalf("start: %v", err)
 	}
-	value, found := c.Get("language")
-	fmt.Printf("get language: value=%v found=%v\n", value, found)
+	log.Printf("cache listening on %s (workers=%d, max-connections=%d)",
+		srv.Addr(), config.WorkerCount, config.MaxConnections)
 
-	// A value that expires after 200ms.
-	if err := c.SetWithTTL("session", "token", 200*time.Millisecond); err != nil {
-		log.Fatalf("set ttl: %v", err)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	<-signals
+
+	log.Print("shutting down")
+	if err := srv.Stop(); err != nil {
+		log.Printf("shutdown: %v", err)
 	}
-	value, found = c.Get("session")
-	fmt.Printf("get session: value=%v found=%v\n", value, found)
-
-	time.Sleep(300 * time.Millisecond)
-
-	// The first read after expiry removes the entry and reports a miss.
-	_, found = c.Get("session")
-	fmt.Printf("get expired session: found=%v\n", found)
-
-	// MaxItems is 2, so adding B evicts the least recently used entry.
-	if err := c.Set("A", 1); err != nil {
-		log.Fatalf("set A: %v", err)
-	}
-	if err := c.Set("B", 2); err != nil {
-		log.Fatalf("set B: %v", err)
-	}
-	_, found = c.Get("language")
-	fmt.Printf("get language after eviction: found=%v\n", found)
-
-	stats := c.Stats()
-	fmt.Printf("stats: hits=%d misses=%d sets=%d deletes=%d expired=%d evictions=%d\n",
-		stats.Hits, stats.Misses, stats.Sets, stats.Deletes, stats.Expired, stats.Evictions)
+	log.Print("stopped")
 }

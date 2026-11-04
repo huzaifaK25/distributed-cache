@@ -38,9 +38,9 @@ problems.
 
 ## Project Status
 
-Phases 1 through 4 are complete: a TCP-accessible in-memory cache with TTL
-expiration, LRU eviction, bounded concurrency, and a cluster membership layer
-with gossip and health detection.
+Phases 1 through 5 are complete: a TCP-accessible in-memory cache with TTL
+expiration, LRU eviction, bounded concurrency, a cluster membership layer with
+gossip and health detection, and WAL-backed primary/replica replication.
 
 Completed features:
 
@@ -57,6 +57,10 @@ Completed features:
 - ✅ Cluster membership and discovery
 - ✅ Heartbeats and health tracking
 - ✅ Gossip convergence
+- ✅ Primary/replica replication
+- ✅ Durable write-ahead log
+- ✅ Full and incremental replica sync
+- ✅ Replication acknowledgements and metrics
 
 Phase 2 additions:
 
@@ -85,6 +89,15 @@ Phase 4 additions:
 - Push-pull anti-entropy gossip with join/leave convergence tests
 - Simulated network delay and packet-loss tests
 
+Phase 5 additions:
+
+- `PRIMARY` and `REPLICA` roles with ordered SET, DEL, and TTL operations
+- Checksummed, fsynced write-ahead log with torn-tail recovery
+- Full snapshot bootstrap with bounded chunks
+- Incremental WAL-based catch-up after reconnect or restart
+- Cumulative acknowledgements, retries, queue bounds, and replication metrics
+- WAL replay recovery tests and real-TCP multi-replica tests
+
 ## Requirements
 
 - Go 1.27 or newer
@@ -101,7 +114,8 @@ distributed-cache/
 |   |-- item.go           # CacheItem metadata
 |   |-- config.go         # Config and capacity/cleanup options
 |   |-- lru.go            # LRU list and eviction helpers
-|   `-- cleanup.go        # Background expiration worker
+|   |-- cleanup.go        # Background expiration worker
+|   `-- snapshot.go       # Consistent snapshot and restore for replication
 |-- internal/server/
 |   |-- server.go         # Lifecycle, listener, connections, shutdown
 |   |-- config.go         # Server limits and timeouts
@@ -115,6 +129,12 @@ distributed-cache/
 |   |-- membership.go     # Lifecycle, join, leave, and metadata
 |   |-- heartbeat.go      # I_AM_ALIVE loop and health updates
 |   `-- gossip.go         # Wire protocol, transport, and anti-entropy
+|-- internal/replication/
+|   |-- replicator.go     # Roles, mutations, local state machine
+|   |-- wal.go            # Durable append-only mutation log
+|   |-- syncer.go         # Wire protocol, snapshot chunks, replica client
+|   |-- coordinator.go    # Lifecycle, primary API, metrics
+|   `-- session.go        # Primary-side replica sessions and acknowledgements
 |-- tests/
 |   |-- cache_test.go     # Cache unit and concurrency tests
 |   |-- ttl_test.go       # TTL and cleanup tests
@@ -123,13 +143,15 @@ distributed-cache/
 |   |-- server_connection_test.go # Limits, idle timeout, 1000 clients
 |   |-- server_shutdown_test.go   # Graceful shutdown tests
 |   |-- cluster_test.go   # Multi-node join, leave, health, convergence
+|   |-- replication_test.go       # Real-TCP primary/replica replication
 |   |-- benchmark_test.go # Cache benchmarks
 |   `-- server_benchmark_test.go  # Server benchmarks
 |-- docs/
 |   |-- phase-1-core-cache.md
 |   |-- phase-2-production-features.md
 |   |-- phase-3-network-server.md
-|   `-- phase-4-cluster-management.md
+|   |-- phase-4-cluster-management.md
+|   `-- phase-5-replication.md
 |-- go.mod
 `-- README.md
 ```
@@ -220,6 +242,51 @@ nodes can join any existing member. Use `Nodes`, `Node`, and `Metadata` to inspe
 the current view. `Leave` announces a graceful exit; `Stop` shuts down without
 announcing.
 
+Replication is also a separate layer until later phases wire it into the server
+and membership view:
+
+```go
+primary, err := replication.New(replication.Config{
+	Role:       replication.RolePrimary,
+	ID:         "node-a",
+	Store:      cache.New(cache.Config{}),
+	WALPath:    "data/node-a.wal",
+	ListenAddr: "127.0.0.1:7101",
+})
+if err != nil {
+	log.Fatal(err)
+}
+if err := primary.Start(); err != nil {
+	log.Fatal(err)
+}
+defer primary.Stop()
+
+replicaStore := cache.New(cache.Config{})
+replica, err := replication.New(replication.Config{
+	Role:        replication.RoleReplica,
+	ID:          "node-b",
+	Store:       replicaStore,
+	WALPath:     "data/node-b.wal",
+	PrimaryAddr: "127.0.0.1:7101",
+})
+if err != nil {
+	log.Fatal(err)
+}
+if err := replica.Start(); err != nil {
+	log.Fatal(err)
+}
+defer replica.Stop()
+
+if err := primary.Set("user:1", "hello"); err != nil {
+	log.Fatal(err)
+}
+```
+
+New replicas bootstrap from a full snapshot, then receive only ordered deltas.
+Every primary write is fsynced to the WAL before replication. `Stats` and
+`Replicas` expose acknowledged, pending, failed, queue-depth, lag, and sync-time
+metrics.
+
 Protocol summary:
 
 | Command | Response |
@@ -272,6 +339,26 @@ Cluster options (zero values use `cluster.DefaultConfig`):
 | `ShutdownTimeout` | `5s` | Bound on graceful cluster shutdown. |
 | `MaxMessageSize` | `1 MiB` | Maximum encoded cluster message size. |
 
+Replication options (zero values use `replication.DefaultConfig`):
+
+| Option | Default | Behavior |
+|---|---:|---|
+| `Role` | required | `PRIMARY` or `REPLICA`. |
+| `ID` | required | Stable unique node identity. |
+| `Store` | required | Cache implementing `Snapshot`/`Restore`. |
+| `WALPath` | required | Durable write-ahead log file. |
+| `ListenAddr` | `127.0.0.1:0` | Primary replication listen address. |
+| `PrimaryAddr` | replica required | Upstream primary address. |
+| `ReconnectMin` / `ReconnectMax` | `100ms` / `2s` | Replica retry backoff bounds. |
+| `HandshakeTimeout` | `5s` | Dial and hello deadline. |
+| `AckTimeout` | `5s` | Frame write and batch acknowledgement deadline. |
+| `MaxRetries` | `3` | Batch and snapshot attempts. |
+| `MaxBatch` | `64` | Mutations per append message. |
+| `SessionQueue` | `4096` | Buffered live mutations per replica. |
+| `SnapshotBatch` | `256` | Entries per snapshot chunk before size splitting. |
+| `MaxMessageSize` | `8 MiB` | Maximum encoded replication frame. |
+| `ShutdownTimeout` | `5s` | Bound on replication shutdown. |
+
 Behavior notes:
 
 - `Set` clears any previous TTL.
@@ -283,6 +370,11 @@ Behavior notes:
 - `Cluster.Leave` removes the node from peers and records a tombstone; `Cluster.Stop` does not announce a leave.
 - Crashed nodes remain in the view as `OFFLINE`; `Leave` removes them from the view.
 - A `Cluster` cannot be restarted after `Stop`.
+- A primary fsyncs every mutation to its WAL before applying or replicating it.
+- Replicas bootstrap from a snapshot, then apply only ordered deltas; a sequence gap forces a fresh full sync.
+- Replica writes return `replication.ErrNotPrimary`.
+- Replicated values must be JSON-serializable and are canonicalized on every node.
+- A `Coordinator` cannot be restarted after `Stop`.
 
 ## Build and Run
 
@@ -341,6 +433,7 @@ results:
 - [Phase 2 - Production Cache Features](docs/phase-2-production-features.md)
 - [Phase 3 - Network Server](docs/phase-3-network-server.md)
 - [Phase 4 - Cluster Management](docs/phase-4-cluster-management.md)
+- [Phase 5 - Replication](docs/phase-5-replication.md)
 
 ## Roadmap
 
@@ -348,7 +441,7 @@ results:
 2. ✅ Production Cache Features (TTL, cleanup, LRU, limits)
 3. ✅ Networked Cache Server
 4. ✅ Cluster Membership (gossip, heartbeats, health)
-5. Replication
+5. ✅ Replication (WAL, full/incremental sync, acknowledgements)
 6. Failover
 7. Consistent Hashing
 8. Observability

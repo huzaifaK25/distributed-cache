@@ -628,7 +628,10 @@ func (c *Coordinator) Stop() error {
 	// Connections and the replica sync loop are unblocked by cancellation.
 	c.closeConnections()
 
-	// Drain a primary write that already passed the state check.
+	// Drain a primary write that already passed the state check. This
+	// zero-length critical section synchronizes with the writer's unlock, so
+	// its WAL commit is complete before shutdown continues. Writers that start
+	// later observe stateStopping in writeState and never touch the WAL.
 	c.writeMu.Lock()
 	c.writeMu.Unlock()
 

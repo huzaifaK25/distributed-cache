@@ -38,10 +38,11 @@ problems.
 
 ## Project Status
 
-Phases 1 through 6 are complete: a TCP-accessible in-memory cache with TTL
+Phases 1 through 7 are complete: a TCP-accessible in-memory cache with TTL
 expiration, LRU eviction, bounded concurrency, a cluster membership layer with
-gossip and health detection, WAL-backed primary/replica replication, and automatic
-Raft-style failover with graceful leadership transfer.
+gossip and health detection, WAL-backed primary/replica replication, automatic
+Raft-style failover with graceful leadership transfer, and consistent-hash
+partition routing with safe rebalancing and migration.
 
 Completed features:
 
@@ -67,6 +68,11 @@ Completed features:
 - ✅ Quorum writes and split-brain protection
 - ✅ Graceful leadership transfer
 - ✅ Automatic node recovery and resynchronization
+- ✅ Consistent hash ring with configurable virtual nodes
+- ✅ Key-to-partition-to-node routing
+- ✅ Minimal-movement rebalancing on node changes
+- ✅ Safe partition migration and node removal
+- ✅ Partitioning and migration metrics
 
 Phase 2 additions:
 
@@ -115,6 +121,18 @@ Phase 6 additions:
 - Dead-node detection and full resynchronization when a node rejoins
 - Kill-primary, transfer, quorum-loss, and data-integrity tests
 
+Phase 7 additions:
+
+- Fixed logical partitions with configurable virtual nodes
+- Deterministic FNV-1a/SplitMix64 ring hashing and collision tie-breaking
+- Key to partition to owner routing with an immutable, atomically published table
+- Add-node, remove-node, and full-membership plans with generation checks
+- Minimal-movement rebalancing that moves only changed partitions
+- Copy-before-commit partition migration with an optional write-quiescence gate
+- In-process `StoreMigrator` with TTL preservation and source cleanup
+- Partition-count, migration-duration, and moved-key metrics
+- Routing, rebalance, migration, node-removal, and failure-safety tests
+
 ## Requirements
 
 - Go 1.27 or newer
@@ -157,6 +175,11 @@ distributed-cache/
 |   |-- detector.go       # Peer health tracking
 |   |-- election.go       # Vote/heartbeat RPCs, campaigns, transfer
 |   `-- leader.go         # Lifecycle, lease, replication promotion, quorum writes
+|-- internal/partitioning/
+|   |-- hashring.go       # Immutable ring, node membership, lookups
+|   |-- vnode.go          # Hash function and virtual-node tokens
+|   |-- partition.go      # Routing, plans, ownership commits, metrics
+|   `-- migration.go      # Migration contract, store migrator, cleanup
 |-- tests/
 |   |-- cache_test.go     # Cache unit and concurrency tests
 |   |-- ttl_test.go       # TTL and cleanup tests
@@ -345,6 +368,58 @@ if err := node.Set("user:1", "hello"); err != nil {
 role, term, leader, quorum lease, replication address, and nested replication
 metrics; `Health` reports each peer's `ALIVE`, `SUSPECT`, or `DEAD` status.
 
+Partitioning maps keys to fixed partitions and then to nodes with a consistent
+hash ring. Plans are prepared first; data moves only when a plan is applied:
+
+```go
+partitioner, err := partitioning.New(partitioning.Config{
+	Nodes: []partitioning.Node{
+		{ID: "node-a", Address: "127.0.0.1:7001"},
+		{ID: "node-b", Address: "127.0.0.1:7002"},
+	},
+	VirtualNodes: 128,
+	Partitions:   1024,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+route, ok := partitioner.Route("user:1")
+if !ok {
+	log.Fatal("cluster has no nodes")
+}
+fmt.Println(route.Partition, route.Node.ID)
+
+plan, err := partitioner.PlanAddNode(partitioning.Node{
+	ID:      "node-c",
+	Address: "127.0.0.1:7003",
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+migrator, err := partitioning.NewStoreMigrator(partitioner)
+if err != nil {
+	log.Fatal(err)
+}
+for id, store := range stores {
+	if err := migrator.RegisterStore(id, store); err != nil {
+		log.Fatal(err)
+	}
+}
+
+result, err := partitioner.Apply(context.Background(), plan, migrator)
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Printf("moved %d keys in %s\n", result.MovedKeys, result.Duration)
+```
+
+`Apply` copies every moved partition before atomically publishing the new
+ownership table. `ApplyWithOptions` accepts a `WriteGate` that quiesces writes
+to moved partitions during the copy and commit window. `Stats` reports partition
+count, rebalances, migrations, moved keys, and migration durations.
+
 Protocol summary:
 
 | Command | Response |
@@ -440,6 +515,15 @@ Failover options (zero values use `failover.DefaultConfig`):
 | `ShutdownTimeout` | `5s` | Grace period before shutdown forces control connections closed. |
 | `MaxMessageSize` | `1 MiB` | Maximum encoded control message. |
 
+Partitioning options (zero values use `partitioning.DefaultConfig`):
+
+| Option | Default | Behavior |
+|---|---:|---|
+| `Nodes` | empty | Initial membership; empty is valid during bootstrap. |
+| `VirtualNodes` | `128` | Ring tokens per physical node. |
+| `Partitions` | `1024` | Fixed logical partitions; maximum 65536. |
+| `Hash` | `DefaultHash` | Deterministic hash shared by every node. |
+
 Behavior notes:
 
 - `Set` clears any previous TTL.
@@ -464,6 +548,14 @@ Behavior notes:
 - A new replica coordinator performs one full sync, then reconnects incrementally.
 - `Node.Stop` is idempotent and does not transfer leadership; call
   `TransferLeadership` first for a graceful exit.
+- A key's partition is stable across membership changes; only its owner moves.
+- Plans do not copy data; call `Apply` with a `Migrator` to commit them.
+- A failed migration leaves the previous ownership table and source data intact.
+- Writes to moved partitions must be paused or gated with `WriteGate` during
+  `Apply`; cleanup errors leave stale source copies but do not roll back the
+  committed owner.
+- The partitioning layer is standalone and is not yet wired into the TCP server
+  or cluster membership view.
 
 ## Build and Run
 
@@ -524,6 +616,7 @@ results:
 - [Phase 4 - Cluster Management](docs/phase-4-cluster-management.md)
 - [Phase 5 - Replication](docs/phase-5-replication.md)
 - [Phase 6 - Failover](docs/phase-6-failover.md)
+- [Phase 7 - Partitioning and Consistent Hashing](docs/phase-7-partitioning.md)
 
 ## Roadmap
 
@@ -533,7 +626,7 @@ results:
 4. ✅ Cluster Membership (gossip, heartbeats, health)
 5. ✅ Replication (WAL, full/incremental sync, acknowledgements)
 6. ✅ Failover (election, quorum, transfer, recovery)
-7. Consistent Hashing
+7. ✅ Partitioning and Consistent Hashing
 8. Observability
 9. Chaos Testing
 10. Benchmarking and Documentation

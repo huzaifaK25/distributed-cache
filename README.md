@@ -38,9 +38,10 @@ problems.
 
 ## Project Status
 
-Phases 1 through 5 are complete: a TCP-accessible in-memory cache with TTL
+Phases 1 through 6 are complete: a TCP-accessible in-memory cache with TTL
 expiration, LRU eviction, bounded concurrency, a cluster membership layer with
-gossip and health detection, and WAL-backed primary/replica replication.
+gossip and health detection, WAL-backed primary/replica replication, and automatic
+Raft-style failover with graceful leadership transfer.
 
 Completed features:
 
@@ -61,6 +62,11 @@ Completed features:
 - ✅ Durable write-ahead log
 - ✅ Full and incremental replica sync
 - ✅ Replication acknowledgements and metrics
+- ✅ Failure detection and peer health
+- ✅ Raft-style leader election with durable terms and votes
+- ✅ Quorum writes and split-brain protection
+- ✅ Graceful leadership transfer
+- ✅ Automatic node recovery and resynchronization
 
 Phase 2 additions:
 
@@ -97,6 +103,17 @@ Phase 5 additions:
 - Incremental WAL-based catch-up after reconnect or restart
 - Cumulative acknowledgements, retries, queue bounds, and replication metrics
 - WAL replay recovery tests and real-TCP multi-replica tests
+
+Phase 6 additions:
+
+- Static-membership `FOLLOWER`, `CANDIDATE`, and `LEADER` states
+- Persistent terms and votes with atomic state-file replacement
+- Randomized elections, log up-to-date checks, and majority quorum
+- Leader lease and quorum-acknowledged writes for split-brain safety
+- Dynamic promotion of a node's replication coordinator from replica to primary
+- Graceful `timeout_now` leadership transfer
+- Dead-node detection and full resynchronization when a node rejoins
+- Kill-primary, transfer, quorum-loss, and data-integrity tests
 
 ## Requirements
 
@@ -135,6 +152,11 @@ distributed-cache/
 |   |-- syncer.go         # Wire protocol, snapshot chunks, replica client
 |   |-- coordinator.go    # Lifecycle, primary API, metrics
 |   `-- session.go        # Primary-side replica sessions and acknowledgements
+|-- internal/failover/
+|   |-- state_machine.go  # Roles, durable term/vote state, timeouts
+|   |-- detector.go       # Peer health tracking
+|   |-- election.go       # Vote/heartbeat RPCs, campaigns, transfer
+|   `-- leader.go         # Lifecycle, lease, replication promotion, quorum writes
 |-- tests/
 |   |-- cache_test.go     # Cache unit and concurrency tests
 |   |-- ttl_test.go       # TTL and cleanup tests
@@ -151,7 +173,8 @@ distributed-cache/
 |   |-- phase-2-production-features.md
 |   |-- phase-3-network-server.md
 |   |-- phase-4-cluster-management.md
-|   `-- phase-5-replication.md
+|   |-- phase-5-replication.md
+|   `-- phase-6-failover.md
 |-- go.mod
 `-- README.md
 ```
@@ -287,6 +310,41 @@ Every primary write is fsynced to the WAL before replication. `Stats` and
 `Replicas` expose acknowledged, pending, failed, queue-depth, lag, and sync-time
 metrics.
 
+Failover sits above replication and elects one replication primary. All nodes
+share a static peer list:
+
+```go
+node, err := failover.New(failover.Config{
+	ClusterID:  "cache-prod",
+	ID:         "node-a",
+	ListenAddr: "127.0.0.1:7101",
+	Peers: []failover.Peer{
+		{ID: "node-b", Address: "127.0.0.1:7102"},
+		{ID: "node-c", Address: "127.0.0.1:7103"},
+	},
+	Store:                 store,
+	WALPath:               "data/node-a.wal",
+	ReplicationListenAddr: "127.0.0.1:7201",
+})
+if err != nil {
+	log.Fatal(err)
+}
+if err := node.Start(); err != nil {
+	log.Fatal(err)
+}
+defer node.Stop()
+
+// Writes are accepted only by the elected leader and wait for a replication
+// quorum. Reads use the local store and may be stale on a follower.
+if err := node.Set("user:1", "hello"); err != nil {
+	log.Fatal(err)
+}
+```
+
+`TransferLeadership` performs a graceful handoff. `Stats` reports the current
+role, term, leader, quorum lease, replication address, and nested replication
+metrics; `Health` reports each peer's `ALIVE`, `SUSPECT`, or `DEAD` status.
+
 Protocol summary:
 
 | Command | Response |
@@ -359,6 +417,29 @@ Replication options (zero values use `replication.DefaultConfig`):
 | `MaxMessageSize` | `8 MiB` | Maximum encoded replication frame. |
 | `ShutdownTimeout` | `5s` | Bound on replication shutdown. |
 
+Failover options (zero values use `failover.DefaultConfig`):
+
+| Option | Default | Behavior |
+|---|---:|---|
+| `ClusterID` | required | Must match across the failover cluster. |
+| `ID` | required | Stable unique node identity. |
+| `ListenAddr` | `127.0.0.1:0` | Control-plane TCP listen address. |
+| `Peers` | empty | Every other node; membership is static. |
+| `Store` | required | Cache implementing `replication.Store`. |
+| `WALPath` | required | Node-private replication WAL. |
+| `StatePath` | `WALPath + ".failover"` | Durable term/vote state. |
+| `ReplicationListenAddr` | `127.0.0.1:0` | Primary replication listen address. |
+| `ReplicationConfig` | replication defaults | Tuning for each coordinator. |
+| `ElectionTimeoutMin` / `Max` | `300ms` / `600ms` | Randomized election window. |
+| `HeartbeatInterval` | `100ms` | Leader heartbeat cadence. |
+| `FailureTimeout` | `max(3 x election max, 2s)` | Detector death threshold. |
+| `RPCTimeout` | `ElectionTimeoutMin / 3` | Control RPC deadline; below half the election timeout. |
+| `WriteTimeout` | `2s` | Quorum acknowledgement deadline. |
+| `TransferTimeout` | `max(3 x election max, 3s)` | Graceful handoff deadline. |
+| `ReplicationRetry` | `200ms` | Endpoint transition retry delay. |
+| `ShutdownTimeout` | `5s` | Grace period before shutdown forces control connections closed. |
+| `MaxMessageSize` | `1 MiB` | Maximum encoded control message. |
+
 Behavior notes:
 
 - `Set` clears any previous TTL.
@@ -375,6 +456,14 @@ Behavior notes:
 - Replica writes return `replication.ErrNotPrimary`.
 - Replicated values must be JSON-serializable and are canonicalized on every node.
 - A `Coordinator` cannot be restarted after `Stop`.
+- Failover requires a static peer list that excludes the local node.
+- A leader renews its lease only when a heartbeat majority responds; without a
+  quorum it steps down and rejects writes.
+- Leader writes return success only after a replication quorum acknowledges the
+  sequence.
+- A new replica coordinator performs one full sync, then reconnects incrementally.
+- `Node.Stop` is idempotent and does not transfer leadership; call
+  `TransferLeadership` first for a graceful exit.
 
 ## Build and Run
 
@@ -434,6 +523,7 @@ results:
 - [Phase 3 - Network Server](docs/phase-3-network-server.md)
 - [Phase 4 - Cluster Management](docs/phase-4-cluster-management.md)
 - [Phase 5 - Replication](docs/phase-5-replication.md)
+- [Phase 6 - Failover](docs/phase-6-failover.md)
 
 ## Roadmap
 
@@ -442,7 +532,7 @@ results:
 3. ✅ Networked Cache Server
 4. ✅ Cluster Membership (gossip, heartbeats, health)
 5. ✅ Replication (WAL, full/incremental sync, acknowledgements)
-6. Failover
+6. ✅ Failover (election, quorum, transfer, recovery)
 7. Consistent Hashing
 8. Observability
 9. Chaos Testing

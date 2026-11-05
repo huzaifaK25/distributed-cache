@@ -76,6 +76,12 @@ type Config struct {
 
 	// ShutdownTimeout bounds waiting for replication goroutines to exit.
 	ShutdownTimeout time.Duration
+
+	// ForceFullSync makes a replica request a full snapshot on its first
+	// connection instead of an incremental delta. Failover sets this when a
+	// new replica coordinator starts so a former leader's diverging WAL
+	// suffix cannot survive a leadership change.
+	ForceFullSync bool
 }
 
 // DefaultConfig returns replication defaults suitable for a small cluster.
@@ -251,7 +257,7 @@ func New(config Config) (*Coordinator, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Coordinator{
+	coordinator := &Coordinator{
 		config:    config,
 		rep:       rep,
 		wal:       wal,
@@ -261,7 +267,9 @@ func New(config Config) (*Coordinator, error) {
 		cancel:    cancel,
 		conns:     make(map[net.Conn]struct{}),
 		sessions:  make(map[*replicaSession]struct{}),
-	}, nil
+	}
+	coordinator.forceFull.Store(config.ForceFullSync)
+	return coordinator, nil
 }
 
 // Start opens the primary listener or launches the replica sync loop.
@@ -436,6 +444,67 @@ func (c *Coordinator) Stats() Stats {
 	c.sessionsMu.Unlock()
 
 	return stats
+}
+
+// WaitForAck waits until at least the requested number of connected replicas
+// have durably acknowledged seq.
+//
+// It is used by layers that require a write quorum before reporting success.
+// The wait is bounded by timeout and returns ErrAckTimeout when the quorum is
+// not reached. Disconnected replicas do not count even if they acknowledged
+// the sequence earlier.
+func (c *Coordinator) WaitForAck(seq uint64, replicas int, timeout time.Duration) error {
+	if replicas <= 0 {
+		return nil
+	}
+	if c.config.Role != RolePrimary {
+		return ErrNotPrimary
+	}
+	if timeout <= 0 {
+		timeout = c.config.AckTimeout
+	}
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if c.ackedReplicas(seq) >= replicas {
+			return nil
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("%w: sequence %d acknowledged by %d of %d replicas",
+				ErrAckTimeout, seq, c.ackedReplicas(seq), replicas)
+		}
+
+		timer := time.NewTimer(remaining)
+		select {
+		case <-c.ctx.Done():
+			timer.Stop()
+			return ErrClosed
+		case <-ticker.C:
+			timer.Stop()
+		case <-timer.C:
+			return fmt.Errorf("%w: sequence %d acknowledged by %d of %d replicas",
+				ErrAckTimeout, seq, c.ackedReplicas(seq), replicas)
+		}
+	}
+}
+
+// ackedReplicas counts connected replicas that have acknowledged seq.
+func (c *Coordinator) ackedReplicas(seq uint64) int {
+	c.sessionsMu.Lock()
+	defer c.sessionsMu.Unlock()
+
+	count := 0
+	for session := range c.sessions {
+		if session.ackedSeq.Load() >= seq {
+			count++
+		}
+	}
+	return count
 }
 
 // Replicas returns connected replicas sorted by ID.

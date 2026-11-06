@@ -3,6 +3,8 @@ package server
 import (
 	"runtime"
 	"time"
+
+	"distributed-cache/internal/observability"
 )
 
 // Defaults used when a Config field is left at its zero value.
@@ -45,6 +47,10 @@ type Config struct {
 
 	// MaxRequestSize is the maximum command-line length in bytes.
 	MaxRequestSize int
+
+	// Telemetry records request metrics, logs, and traces. It is optional;
+	// when nil the server does no request instrumentation.
+	Telemetry *observability.Telemetry
 }
 
 // DefaultConfig returns production-oriented server defaults.

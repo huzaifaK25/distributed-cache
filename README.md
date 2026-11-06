@@ -38,11 +38,13 @@ problems.
 
 ## Project Status
 
-Phases 1 through 7 are complete: a TCP-accessible in-memory cache with TTL
+Phases 1 through 8 are complete: a TCP-accessible in-memory cache with TTL
 expiration, LRU eviction, bounded concurrency, a cluster membership layer with
 gossip and health detection, WAL-backed primary/replica replication, automatic
-Raft-style failover with graceful leadership transfer, and consistent-hash
-partition routing with safe rebalancing and migration.
+Raft-style failover with graceful leadership transfer, consistent-hash
+partition routing with safe rebalancing and migration, and end-to-end
+observability with structured logs, Prometheus metrics, OpenTelemetry traces,
+Grafana dashboards, and alerts.
 
 Completed features:
 
@@ -73,6 +75,10 @@ Completed features:
 - ✅ Minimal-movement rebalancing on node changes
 - ✅ Safe partition migration and node removal
 - ✅ Partitioning and migration metrics
+- ✅ Request-correlated structured logging
+- ✅ Prometheus metrics endpoint
+- ✅ OpenTelemetry tracing
+- ✅ Grafana dashboard, alerts, and scrape configuration
 
 Phase 2 additions:
 
@@ -133,6 +139,17 @@ Phase 7 additions:
 - Partition-count, migration-duration, and moved-key metrics
 - Routing, rebalance, migration, node-removal, and failure-safety tests
 
+Phase 8 additions:
+
+- Request-scoped JSON logs with `requestID`, `nodeID`, `operation`, `traceID`, and `spanID`
+- Required Prometheus counters: `requests_total`, `cache_hits`, `cache_misses`, and `evictions`
+- End-to-end latency histogram, in-flight requests, replication lag/backlog, and node health metrics
+- `/metrics` Prometheus endpoint and `/healthz` liveness endpoint
+- OpenTelemetry tracing with stdout and OTLP/HTTP exporters
+- Configurable trace sampling and W3C context propagation for future callers
+- Embedded Grafana dashboard and Prometheus alert rules for latency, replication lag, node failures, and error rate
+- Metrics, logging, tracing, dashboard, and server-integration tests
+
 ## Requirements
 
 - Go 1.27 or newer
@@ -141,7 +158,7 @@ Phase 7 additions:
 
 ```text
 distributed-cache/
-|-- cmd/cache/            # TCP server entry point
+|-- cmd/cache/            # TCP server, metrics endpoint, and tracing setup
 |-- internal/cache/
 |   |-- cache.go          # Cache interface and TTL error
 |   |-- memory.go         # InMemoryCache implementation
@@ -180,6 +197,15 @@ distributed-cache/
 |   |-- vnode.go          # Hash function and virtual-node tokens
 |   |-- partition.go      # Routing, plans, ownership commits, metrics
 |   `-- migration.go      # Migration contract, store migrator, cleanup
+|-- internal/observability/
+|   |-- metrics.go        # Prometheus collectors, registry, HTTP handler
+|   |-- logging.go        # Structured slog logger and request IDs
+|   |-- tracing.go        # OpenTelemetry provider and request telemetry
+|   |-- dashboard.go      # Embedded dashboard and alert assets
+|   `-- assets/
+|       |-- grafana-dashboard.json
+|       |-- alerts.yml
+|       `-- prometheus.yml
 |-- tests/
 |   |-- cache_test.go     # Cache unit and concurrency tests
 |   |-- ttl_test.go       # TTL and cleanup tests
@@ -189,6 +215,7 @@ distributed-cache/
 |   |-- server_shutdown_test.go   # Graceful shutdown tests
 |   |-- cluster_test.go   # Multi-node join, leave, health, convergence
 |   |-- replication_test.go       # Real-TCP primary/replica replication
+|   |-- observability_test.go     # Server metrics, logs, and traces
 |   |-- benchmark_test.go # Cache benchmarks
 |   `-- server_benchmark_test.go  # Server benchmarks
 |-- docs/
@@ -197,7 +224,9 @@ distributed-cache/
 |   |-- phase-3-network-server.md
 |   |-- phase-4-cluster-management.md
 |   |-- phase-5-replication.md
-|   `-- phase-6-failover.md
+|   |-- phase-6-failover.md
+|   |-- phase-7-partitioning.md
+|   `-- phase-8-observability.md
 |-- go.mod
 `-- README.md
 ```
@@ -208,6 +237,13 @@ Start the server:
 
 ```sh
 go run ./cmd/cache -addr 127.0.0.1:6379
+```
+
+Prometheus metrics and a liveness probe are served by default:
+
+```sh
+curl http://127.0.0.1:9090/metrics
+curl http://127.0.0.1:9090/healthz
 ```
 
 Then connect with any TCP client and send line commands:
@@ -420,6 +456,112 @@ ownership table. `ApplyWithOptions` accepts a `WriteGate` that quiesces writes
 to moved partitions during the copy and commit window. `Stats` reports partition
 count, rebalances, migrations, moved keys, and migration durations.
 
+Observability is wired into the TCP server through `server.Config.Telemetry`:
+
+```sh
+go run ./cmd/cache \
+  -addr 127.0.0.1:6379 \
+  -node-id node-a \
+  -metrics-addr 127.0.0.1:9090 \
+  -trace-exporter stdout \
+  -trace-sample 1.0
+```
+
+JSON request logs are written to stdout and spans are written to stderr by the
+stdout exporter. A request log record contains the required correlation fields:
+
+```json
+{
+  "time": "2026-11-06T12:00:00.000Z",
+  "level": "INFO",
+  "msg": "request completed",
+  "nodeID": "node-a",
+  "requestID": "8a891f60d9a4f1c5ad30eb2f70f4ac39",
+  "operation": "GET",
+  "traceID": "3f1eaf96818bb7f4ef843a90df61373d",
+  "spanID": "e96b5e62e2a08de2",
+  "status": "ok",
+  "durationMs": 0.153,
+  "responseBytes": 5,
+  "writeOK": true,
+  "remoteAddr": "127.0.0.1:51234"
+}
+```
+
+The same service can be embedded with its observability bundle:
+
+```go
+c := cache.New(cache.Config{})
+defer c.StopCleanupWorker()
+
+logger := observability.NewLogger(observability.LoggingConfig{NodeID: "node-a"})
+metrics := observability.NewMetrics(observability.MetricsConfig{
+	NodeID:     "node-a",
+	CacheStats: c.Stats,
+})
+tracer, err := observability.NewTracer(context.Background(), observability.TracingConfig{
+	NodeID:       "node-a",
+	Exporter:     observability.TraceExporterStdout,
+	SampleRatio:  1,
+})
+if err != nil {
+	log.Fatal(err)
+}
+defer func() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = tracer.Shutdown(ctx)
+}()
+
+s := server.New(c, server.Config{
+	Telemetry: observability.NewTelemetry(metrics, logger, tracer),
+})
+```
+
+When running the replication or failover layers, feed their snapshots into the
+same metrics registry so the bundled alerts and dashboard work across the
+cluster:
+
+```go
+metrics := observability.NewMetrics(observability.MetricsConfig{
+	NodeID:     node.ID(),
+	CacheStats: store.Stats,
+	ReplicationStats: func() (replication.Stats, bool) {
+		stats := node.Stats()
+		return stats.Replication, stats.Replication.Role != ""
+	},
+	NodeHealth: func() []observability.NodeHealth {
+		health := node.Health()
+		nodes := make([]observability.NodeHealth, 0, len(health))
+		for _, peer := range health {
+			nodes = append(nodes, observability.NodeHealth{
+				ID:     peer.ID,
+				Status: string(peer.Status),
+			})
+		}
+		return nodes
+	},
+})
+```
+
+Prometheus can scrape `/metrics`, and Grafana can import the bundled dashboard.
+The Prometheus scrape configuration, recording alert rules, and dashboard are
+also available programmatically:
+
+```go
+if err := observability.WriteAssets("deploy/observability"); err != nil {
+	log.Fatal(err)
+}
+```
+
+The files are copied from `internal/observability/assets`:
+
+| File | Purpose |
+|---|---|
+| `prometheus.yml` | Scrape configuration for the cache metrics endpoint. |
+| `alerts.yml` | High latency, replication lag, node failure, error-rate, and queue saturation alerts. |
+| `grafana-dashboard.json` | Requests, cache hit ratio, latency percentiles, evictions, replication backlog, and node availability. |
+
 Protocol summary:
 
 | Command | Response |
@@ -456,6 +598,20 @@ Server options (zero values use `server.DefaultConfig`):
 | `WriteTimeout` | `10s` | Bound each response write. |
 | `ShutdownTimeout` | `10s` | Bound graceful shutdown. |
 | `MaxRequestSize` | `64 KiB` | Maximum command-line bytes. |
+| `Telemetry` | `nil` | Optional metrics, logger, and tracer bundle; nil disables instrumentation. |
+
+Command-line observability options:
+
+| Option | Default | Behavior |
+|---|---|---|
+| `-node-id` | hostname | Node identity in logs, metrics, and traces. |
+| `-metrics-addr` | `127.0.0.1:9090` | Metrics and health HTTP listen address; empty disables the endpoint. |
+| `-log-level` | `info` | `debug`, `info`, `warn`, or `error`. |
+| `-log-text` | `false` | Emit text logs instead of JSON. |
+| `-trace-exporter` | `stdout` | `none`, `stdout`, or `otlp`. |
+| `-otel-endpoint` | `localhost:4318` | OTLP/HTTP collector endpoint when the exporter is `otlp`. |
+| `-otel-insecure` | `true` | Disable TLS for an OTLP host:port endpoint. |
+| `-trace-sample` | `1.0` | Fraction of new traces to sample. |
 
 Cluster options (zero values use `cluster.DefaultConfig`):
 
@@ -556,6 +712,20 @@ Behavior notes:
   committed owner.
 - The partitioning layer is standalone and is not yet wired into the TCP server
   or cluster membership view.
+- `requests_total` counts every successfully read command line, including parse
+  failures (operation `PARSE`).
+- `cache_hits`, `cache_misses`, and `evictions` are read from the cache's
+  cumulative counters when Prometheus scrapes the endpoint.
+- `node_up` is 1 only for `ONLINE` and `ALIVE`; `DEGRADED`, `SUSPECT`,
+  `OFFLINE`, and `DEAD` report 0.
+- A nil `Telemetry` value disables request instrumentation without changing
+  protocol behavior.
+- The stdout trace exporter writes spans to stderr so they do not interleave
+  with JSON request logs on stdout.
+- The metrics endpoint has no authentication. Bind it to a private interface or
+  protect it with a reverse proxy in production.
+- The TCP server does not yet propagate client-supplied W3C `traceparent`
+  headers; each client command starts a new root trace.
 
 ## Build and Run
 
@@ -565,9 +735,9 @@ go run ./cmd/cache -addr 127.0.0.1:6379
 ```
 
 Useful flags include `-workers`, `-queue-size`, `-max-conns`,
-`-idle-timeout`, `-shutdown-timeout`, `-max-items`, and
-`-cleanup-interval`. The process shuts down gracefully on `Ctrl+C` or
-`SIGTERM`.
+`-idle-timeout`, `-shutdown-timeout`, `-max-items`, `-cleanup-interval`,
+`-metrics-addr`, `-trace-exporter`, and `-log-level`. The process shuts down
+gracefully on `Ctrl+C` or `SIGTERM`.
 
 ## Test
 
@@ -617,6 +787,7 @@ results:
 - [Phase 5 - Replication](docs/phase-5-replication.md)
 - [Phase 6 - Failover](docs/phase-6-failover.md)
 - [Phase 7 - Partitioning and Consistent Hashing](docs/phase-7-partitioning.md)
+- [Phase 8 - Observability](docs/phase-8-observability.md)
 
 ## Roadmap
 
@@ -627,6 +798,6 @@ results:
 5. ✅ Replication (WAL, full/incremental sync, acknowledgements)
 6. ✅ Failover (election, quorum, transfer, recovery)
 7. ✅ Partitioning and Consistent Hashing
-8. Observability
+8. ✅ Observability (metrics, logs, traces, dashboards, alerts)
 9. Chaos Testing
 10. Benchmarking and Documentation

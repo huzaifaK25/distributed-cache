@@ -1,0 +1,100 @@
+groups:
+  - name: distributed-cache
+    interval: 30s
+    rules:
+      - alert: HighRequestLatencyP95
+        expr: histogram_quantile(0.95, sum by (le) (rate(request_duration_seconds_bucket[5m]))) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: Cache p95 request latency is above 100 ms
+          description: >-
+            The 95th percentile end-to-end request latency has been above
+            100 ms for 2 minutes (current value: {{ $value }} s).
+
+      - alert: HighRequestLatencyP99
+        expr: histogram_quantile(0.99, sum by (le) (rate(request_duration_seconds_bucket[5m]))) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          component: cache
+        annotations:
+          summary: Cache p99 request latency is above 500 ms
+          description: >-
+            The 99th percentile end-to-end request latency has been above
+            500 ms for 2 minutes (current value: {{ $value }} s).
+
+      - alert: ReplicationLagHigh
+        expr: max by (node_id) (replication_lag_seconds) > 2
+        for: 1m
+        labels:
+          severity: warning
+          component: replication
+        annotations:
+          summary: Replication lag on {{ $labels.node_id }} is above 2 seconds
+          description: >-
+            The oldest pending replication work on node {{ $labels.node_id }}
+            has been waiting for more than 2 seconds (current value: {{ $value }} s).
+
+      - alert: ReplicationLagCritical
+        expr: max by (node_id) (replication_lag_seconds) > 10
+        for: 2m
+        labels:
+          severity: critical
+          component: replication
+        annotations:
+          summary: Replication lag on {{ $labels.node_id }} is above 10 seconds
+          description: >-
+            Replication on node {{ $labels.node_id }} is more than 10 seconds
+            behind (current value: {{ $value }} s). Replicas may serve stale
+            reads and a leader change may lose recent writes.
+
+      - alert: NodeDown
+        expr: node_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: cluster
+        annotations:
+          summary: Cache node {{ $labels.node_id }} is down
+          description: >-
+            Node {{ $labels.node_id }} has been reported as unavailable for at
+            least 1 minute.
+
+      - alert: AllCacheNodesDown
+        expr: sum(node_up) == 0
+        for: 30s
+        labels:
+          severity: critical
+          component: cluster
+        annotations:
+          summary: All cache nodes are down
+          description: >-
+            No cache node is reporting node_up=1. The cache cluster is unable
+            to serve any traffic.
+
+      - alert: HighRequestErrorRate
+        expr: sum(rate(requests_total{status="error"}[5m])) / clamp_min(sum(rate(requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: Cache request error rate is above 5 percent
+          description: >-
+            More than 5 percent of cache requests have failed for 5 minutes
+            (current ratio: {{ $value }}).
+
+      - alert: RequestQueueSaturation
+        expr: sum(rate(requests_total{status="busy"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          component: cache
+        annotations:
+          summary: Cache worker queue is rejecting requests
+          description: >-
+            Clients have received "ERR server busy" responses for 2 minutes.
+            Increase WorkerCount or QueueSize, or reduce load.

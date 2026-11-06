@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -100,15 +101,26 @@ func (s *Server) serveConnection(conn *connection) {
 		conn.touch()
 		s.requests.Add(1)
 
-		command, err := ParseCommand(line)
-		if err != nil {
-			if !s.writeResponse(conn, "ERR "+err.Error()) {
-				return
-			}
-			continue
+		command, parseErr := ParseCommand(line)
+		operation := "PARSE"
+		if parseErr == nil {
+			operation = string(command.Type)
 		}
 
-		if !s.writeResponse(conn, s.execute(command)) {
+		// Start observation after parsing so the operation label is known.
+		// Parse failures are still traced, logged, and counted as requests.
+		request := s.config.Telemetry.StartRequest(context.Background(), operation, conn.remoteAddr)
+
+		var response string
+		if parseErr != nil {
+			response = "ERR " + parseErr.Error()
+		} else {
+			response = s.execute(command)
+		}
+
+		writeOK := s.writeResponse(conn, response)
+		request.Finish(response, writeOK)
+		if !writeOK {
 			return
 		}
 		if s.isStopping() {

@@ -38,13 +38,15 @@ problems.
 
 ## Project Status
 
-Phases 1 through 8 are complete: a TCP-accessible in-memory cache with TTL
+Phases 1 through 9 are complete: a TCP-accessible in-memory cache with TTL
 expiration, LRU eviction, bounded concurrency, a cluster membership layer with
 gossip and health detection, WAL-backed primary/replica replication, automatic
 Raft-style failover with graceful leadership transfer, consistent-hash
-partition routing with safe rebalancing and migration, and end-to-end
+partition routing with safe rebalancing and migration, end-to-end
 observability with structured logs, Prometheus metrics, OpenTelemetry traces,
-Grafana dashboards, and alerts.
+Grafana dashboards, and alerts, and a chaos-engineering harness for latency,
+packet loss, crashes, partitions, resource pressure, recovery validation, and
+SLO reporting.
 
 Completed features:
 
@@ -79,6 +81,11 @@ Completed features:
 - ✅ Prometheus metrics endpoint
 - ✅ OpenTelemetry tracing
 - ✅ Grafana dashboard, alerts, and scrape configuration
+- ✅ Artificial latency and packet-loss injection
+- ✅ Random node crashes and automatic recovery validation
+- ✅ Network partition injection and healing
+- ✅ CPU and memory pressure simulation
+- ✅ Availability, error-rate, and latency SLO reports
 
 Phase 2 additions:
 
@@ -150,6 +157,18 @@ Phase 8 additions:
 - Embedded Grafana dashboard and Prometheus alert rules for latency, replication lag, node failures, and error rate
 - Metrics, logging, tracing, dashboard, and server-integration tests
 
+Phase 9 additions:
+
+- Uniform latency injection for connections and accepted listeners
+- Deterministic packet loss with cumulative attempt/drop statistics
+- Seeded random node crashes with tracked recovery
+- Group-based network partitions that enforce `ErrPartitioned` on wrapped links
+- Bounded CPU-worker and retained-memory pressure with automatic cleanup
+- Scenario runner with scheduled fault actions, events, and step-error reporting
+- Automatic partition healing, node restart, and stability-window recovery validation
+- Availability, error-rate, p50/p95/p99 latency, and max-latency SLO reports
+- Real-cluster crash/restart integration tests and real-server latency/partition tests
+
 ## Requirements
 
 - Go 1.27 or newer
@@ -206,6 +225,11 @@ distributed-cache/
 |       |-- grafana-dashboard.json
 |       |-- alerts.yml
 |       `-- prometheus.yml
+|-- internal/chaos/
+|   |-- faults.go         # Packet loss, crash injection, resource pressure
+|   |-- latency.go        # Latency injector and listener/connection wrappers
+|   |-- partition.go      # Named-link partitions and ErrPartitioned
+|   `-- runner.go         # Scenarios, recovery validation, SLO reports
 |-- tests/
 |   |-- cache_test.go     # Cache unit and concurrency tests
 |   |-- ttl_test.go       # TTL and cleanup tests
@@ -216,6 +240,7 @@ distributed-cache/
 |   |-- cluster_test.go   # Multi-node join, leave, health, convergence
 |   |-- replication_test.go       # Real-TCP primary/replica replication
 |   |-- observability_test.go     # Server metrics, logs, and traces
+|   |-- chaos_test.go     # Real-cluster crash recovery and wrapped server traffic
 |   |-- benchmark_test.go # Cache benchmarks
 |   `-- server_benchmark_test.go  # Server benchmarks
 |-- docs/
@@ -226,7 +251,8 @@ distributed-cache/
 |   |-- phase-5-replication.md
 |   |-- phase-6-failover.md
 |   |-- phase-7-partitioning.md
-|   `-- phase-8-observability.md
+|   |-- phase-8-observability.md
+|   `-- phase-9-chaos-engineering.md
 |-- go.mod
 `-- README.md
 ```
@@ -562,6 +588,92 @@ The files are copied from `internal/observability/assets`:
 | `alerts.yml` | High latency, replication lag, node failure, error-rate, and queue saturation alerts. |
 | `grafana-dashboard.json` | Requests, cache hit ratio, latency percentiles, evictions, replication backlog, and node availability. |
 
+Chaos engineering is a standalone harness that wraps connections and controls
+node lifecycles without adding fault switches to production code:
+
+```go
+latency, err := chaos.NewLatency(chaos.LatencyConfig{
+	Min:  5 * time.Millisecond,
+	Max:  20 * time.Millisecond,
+	Seed: 1,
+})
+if err != nil {
+	log.Fatal(err)
+}
+clientConn = latency.Wrap(clientConn)
+
+loss, err := chaos.NewLoss(chaos.LossConfig{Probability: 0.02, Seed: 1})
+if err != nil {
+	log.Fatal(err)
+}
+clientConn = loss.Wrap(clientConn)
+
+partition := chaos.NewPartition()
+if err := partition.Split(
+	[]string{"node-a"},
+	[]string{"node-b"},
+); err != nil {
+	log.Fatal(err)
+}
+link := partition.Wrap(clientConn, "node-a", "node-b")
+partition.Heal() // The same link works again.
+
+pressure, err := chaos.NewResourcePressure(chaos.PressureConfig{
+	CPUWorkers:  2,
+	MemoryBytes: 64 << 20,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+runner, err := chaos.NewRunner(chaos.RunnerConfig{
+	Targets: []chaos.Target{
+		{ID: "node-a", Stop: stopA, Recover: startA, Healthy: healthyA},
+		{ID: "node-b", Stop: stopB, Recover: startB, Healthy: healthyB},
+	},
+	Probe:         ping,
+	ProbeInterval: 50 * time.Millisecond,
+	SLO: chaos.SLOConfig{
+		Availability: 0.99,
+		ErrorRate:    0.01,
+		P95Latency:   100 * time.Millisecond,
+	},
+	Recovery: chaos.RecoveryConfig{
+		Timeout:   10 * time.Second,
+		StableFor: 2 * time.Second,
+		Interval:  50 * time.Millisecond,
+	},
+	Seed: 42,
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+report, err := runner.Run(context.Background(), chaos.Scenario{
+	Name:     "crash-partition-recovery",
+	Duration: 30 * time.Second,
+	Steps: []chaos.Step{
+		{At: 5 * time.Second, Name: "pressure", Action: chaos.StartPressureAction(pressure)},
+		{At: 10 * time.Second, Name: "crash", Action: chaos.CrashAction(1)},
+		{At: 20 * time.Second, Name: "split", Action: chaos.SplitAction(
+			[]string{"node-a"}, []string{"node-b"},
+		)},
+		{At: 25 * time.Second, Name: "heal", Action: chaos.HealAction()},
+	},
+})
+fmt.Println(report.SLO)
+if err != nil {
+	log.Printf("chaos run: %v", err)
+}
+```
+
+After the scenario window, the runner releases pressure, heals partitions,
+restarts crashed targets, and requires every health check to stay healthy for
+`Recovery.StableFor`. `report.SLO` contains availability, error rate, p50, p95,
+p99, and maximum latency; `report.Events` records crashes, recoveries,
+partitions, heals, and errors. A node `Recover` callback must start a fresh
+instance with the same identity and rejoin a live seed.
+
 Protocol summary:
 
 | Command | Response |
@@ -680,6 +792,34 @@ Partitioning options (zero values use `partitioning.DefaultConfig`):
 | `Partitions` | `1024` | Fixed logical partitions; maximum 65536. |
 | `Hash` | `DefaultHash` | Deterministic hash shared by every node. |
 
+Chaos runner options (zero values use package defaults):
+
+| Option | Default | Behavior |
+|---|---:|---|
+| `Targets` | required | Nodes/services controlled by crash injection. |
+| `Probe` | optional | Request-level SLO probe; latency and errors. |
+| `HealthCheck` | optional | Service-wide availability probe. |
+| `ProbeInterval` | `100ms` | SLO probe cadence during a scenario. |
+| `SLO.Availability` | `0.99` | Minimum healthy fraction. |
+| `SLO.ErrorRate` | `0.01` | Maximum failed-request fraction. |
+| `SLO.P95Latency` | `100ms` | Maximum p95 request latency. |
+| `Recovery.Timeout` | `10s` | Bound on post-scenario recovery validation. |
+| `Recovery.StableFor` | `1s` | Required continuous healthy window. |
+| `Recovery.Interval` | `50ms` | Recovery health poll interval. |
+| `Seed` | clock | Reproducible crash victim selection. |
+
+Chaos fault options:
+
+| Option | Default | Behavior |
+|---|---:|---|
+| `LatencyConfig.Min` / `Max` | `0` / `Min` | Per-read/write delay range. |
+| `LossConfig.Probability` | required | Whole-write drop probability in `[0, 1]`. |
+| `LossConfig.Seed` | clock | Reproducible drop sequence. |
+| `CrashConfig.Seed` | clock | Reproducible crash victim selection. |
+| `PressureConfig.CPUWorkers` | `0` | Busy-loop goroutines. |
+| `PressureConfig.MemoryBytes` | `0` | Retained memory allocation. |
+| `PressureConfig.MemoryChunk` | `1 MiB` | Allocation unit. |
+
 Behavior notes:
 
 - `Set` clears any previous TTL.
@@ -726,6 +866,22 @@ Behavior notes:
   protect it with a reverse proxy in production.
 - The TCP server does not yet propagate client-supplied W3C `traceparent`
   headers; each client command starts a new root trace.
+- Chaos faults are opt-in connection wrappers and target callbacks. Production
+  packages do not import `internal/chaos`.
+- A dropped chaos write reports success and never reaches the wrapped
+  connection.
+- Latency is applied to each read and write separately, not once per request.
+- Partitions affect only connections wrapped with the same `Partition`; unlisted
+  nodes are unconstrained.
+- The runner releases pressure, heals partitions, restarts crashed targets, and
+  then requires every health source to remain healthy for the recovery stable
+  window.
+- SLO probes stop before recovery cleanup, so reports measure the experiment
+  window rather than restart time.
+- A zero chaos seed uses the clock; non-zero seeds make crash and loss selection
+  reproducible.
+- A crashed cluster member must recover on the same fixed address and rejoin a
+  live seed because a `cluster.Cluster` cannot be restarted after `Stop`.
 
 ## Build and Run
 
@@ -759,6 +915,16 @@ $env:CGO_ENABLED = "1"
 go test -race ./...
 ```
 
+Chaos, fault, and recovery tests:
+
+```sh
+go test ./internal/chaos ./tests -run "Chaos|Fault|Partition|Runner|SLO|Pressure|Latency" -count=1
+```
+
+The real-cluster integration test starts three members on fixed loopback
+addresses, crashes one through the scenario runner, starts a replacement on the
+same address, and waits for all membership views to reconverge.
+
 ## Benchmarks
 
 ```sh
@@ -788,6 +954,7 @@ results:
 - [Phase 6 - Failover](docs/phase-6-failover.md)
 - [Phase 7 - Partitioning and Consistent Hashing](docs/phase-7-partitioning.md)
 - [Phase 8 - Observability](docs/phase-8-observability.md)
+- [Phase 9 - Chaos Engineering](docs/phase-9-chaos-engineering.md)
 
 ## Roadmap
 
@@ -799,5 +966,5 @@ results:
 6. ✅ Failover (election, quorum, transfer, recovery)
 7. ✅ Partitioning and Consistent Hashing
 8. ✅ Observability (metrics, logs, traces, dashboards, alerts)
-9. Chaos Testing
+9. ✅ Chaos Testing
 10. Benchmarking and Documentation
